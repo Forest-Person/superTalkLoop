@@ -48,11 +48,12 @@ FRAME_SIZE = int(SAMPLE_RATE * FRAME_MS / 1000)
 
 # --- VAD & INTERRUPTION SETTINGS ---
 # --- VAD & INTERRUPTION SETTINGS ---
-VAD_INTERRUPT_SENSITIVITY = 2      # Changed from 1 to 2 (Stricter speech check)
+VAD_INTERRUPT_SENSITIVITY = 1      # Changed from 2 to 1 (More sensitive speech check)
 VAD_RECORD_SENSITIVITY = 2         # Changed from 1 to 2 (Matches interrupt strictness)
-RMS_THRESHOLD = 0.035              # Increased from 0.01 (The "Wall" against background noise)
-INTERRUPT_FRAME_COUNT = 12         # Increased from 8 (Requires longer spoken phrase to trigger)
+RMS_THRESHOLD = 0.015              # Decreased from 0.035 (Half volume for easier interruption)
+INTERRUPT_FRAME_COUNT = 10         # Decreased from 12 (Slightly snappier response)
 SILENCE_THRESHOLD_MS = 1500        # (Unchanged, keeps the listening window natural)
+AUTONOMY_TIMEOUT = 2               # Seconds to wait before agents take initiative
 
 # --- Logging Helper ---
 def log(subsystem: str, message: str):
@@ -267,23 +268,30 @@ class ChatRoom:
     def __init__(self):
         self.agents: Dict[str, ChatAgent] = {}
         self.director = AgentDirector(http_session, LLAMA_SERVER_URL)
+        self.system_voice = None
         # 10 Voices available
         self.all_voices = [
             "M1", "M2", "M3", "M4", "M5", 
             "F1", "F2", "F3", "F4", "F5"
         ]
 
+    def set_system_voice(self, voice_id):
+        self.system_voice = voice_id
+
     def add_agent(self, name, prompt):
         if len(self.agents) >= 10:
             return "Cannot add agent. Maximum capacity (10) reached."
 
         used_voices = {agent.voice_id for agent in self.agents.values()}
+        if self.system_voice:
+            used_voices.add(self.system_voice)
+
         available_voices = [v for v in self.all_voices if v not in used_voices]
 
         if not available_voices:
             voice = random.choice(self.all_voices)
         else:
-            voice = available_voices[0]
+            voice = random.choice(available_voices)
         
         self.agents[name] = ChatAgent(name, prompt, voice_id=voice)
         log("SYSTEM", f"Created Agent: {name} (Voice: {voice})")
@@ -307,13 +315,22 @@ class ChatRoom:
     def create_default_group(self):
         log("SYSTEM", "Creating Default 4-Agent Group...")
         defaults = [
-            ("Orion", "A logical and analytical strategist who loves data.", "M1"),
-            ("Lyra", "A creative and enthusiastic dreamer who loves art.", "F1"),
-            ("Atlas", "A grounded and strong-willed protector.", "M2"),
-            ("Selene", "A mysterious and philosophical observer.", "F2")
+            ("Orion", "A logical and analytical strategist who loves data."),
+            ("Lyra", "A creative and enthusiastic dreamer who loves art."),
+            ("Atlas", "A grounded and strong-willed protector."),
+            ("Selene", "A mysterious and philosophical observer.")
         ]
-        for name, prompt, voice in defaults:
-            if len(self.agents) < 4:
+        
+        used_voices = {agent.voice_id for agent in self.agents.values()}
+        if self.system_voice:
+            used_voices.add(self.system_voice)
+
+        available = [v for v in self.all_voices if v not in used_voices]
+        random.shuffle(available)
+
+        for i, (name, prompt) in enumerate(defaults):
+            if len(self.agents) < 4 and available:
+                voice = available[i % len(available)]
                 self.agents[name] = ChatAgent(name, prompt, voice_id=voice)
 
     def run_session(self, participants_str=None, topic=None):
@@ -818,6 +835,11 @@ def main():
     play_startup_sound()
     log("SYSTEM", "SuperTonic v30.6 - PyPI Robust")
 
+    # Select a random voice for the system/admin for this session
+    system_voice = random.choice(chat_room.all_voices)
+    chat_room.set_system_voice(system_voice)
+    log("SYSTEM", f"System Voice assigned: {system_voice}")
+
     try:
         while True:
             interruption_event.clear()
@@ -841,13 +863,13 @@ def main():
                     if pending_action["type"] == "wipe_memory":
                         conversation_history = []
                         log("SYSTEM", "History cleared.")
-                        enqueue_tts("Memory wiped.", global_turn_id)
+                        enqueue_tts("Memory wiped.", global_turn_id, voice_id=system_voice)
                     elif pending_action["type"] == "delete_agent":
                         target = pending_action["name"]
                         msg = chat_room.delete_agent(target)
-                        enqueue_tts(msg, global_turn_id)
+                        enqueue_tts(msg, global_turn_id, voice_id=system_voice)
                 else:
-                    enqueue_tts("Action cancelled.", global_turn_id)
+                    enqueue_tts("Action cancelled.", global_turn_id, voice_id=system_voice)
 
                 pending_action = None
                 wait_for_turn()
@@ -864,7 +886,7 @@ def main():
 
             if route == "SYSTEM":
                 stream = capture_generator(Orchestrator.stream_admin_agent(user_text))
-                smart_buffer_stream(stream, label="ADMIN", voice_id="M1")
+                smart_buffer_stream(stream, label="ADMIN", voice_id=system_voice)
 
                 if interruption_event.is_set():
                     time.sleep(0.5)
@@ -882,11 +904,11 @@ def main():
                         chat_room.run_session(participants, topic)
                         continue
                     elif res:
-                        enqueue_tts(res, global_turn_id, voice_id="M1")
+                        enqueue_tts(res, global_turn_id, voice_id=system_voice)
                         wait_for_turn()
             else:
                 stream = capture_generator(Orchestrator.stream_chat_agent(user_text))
-                smart_buffer_stream(stream, label="AI", voice_id="M1")
+                smart_buffer_stream(stream, label="AI", voice_id=system_voice)
 
                 if interruption_event.is_set():
                     time.sleep(0.5)

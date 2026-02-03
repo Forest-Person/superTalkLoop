@@ -46,6 +46,30 @@ graph TD
     TTS -->|WAV Audio| Client
 ```
 
+## ✨ New Features
+
+### 🎮 Startup Menu
+When you launch the system, you are presented with three modes:
+*   **[C]hat Mode:** The standard voice-controlled experience.
+*   **[A]gent Creation Mode:** Manual text input to define names and descriptions for up to **10 custom agents**.
+*   **[M]eet the Moms:** A "Quick Start" preset that loads three suburban moms (Karen, Linda, Susan) into a high-drama rivalry over a bake sale.
+
+### 🤖 Autonomous "Auto-Loop" Mode
+You can now step back and let the AI agents converse entirely on their own.
+*   **Toggle:** Press **Enter** while in a chat room to toggle "Non-Interactive Mode."
+*   **Behavior:** In this mode, agents take initiative automatically. Microphone interruptions are disabled to prevent the AI from interrupting itself with its own echo.
+*   **Observation:** The UI is cleanly color-coded so you can watch the drama unfold.
+
+### 🎭 Enhanced AI Director
+The "Director" has been upgraded with sophisticated social logic:
+*   **Strict Turn-Taking:** Prevents the same agent from speaking twice in a row.
+*   **Silence Tracking:** Monitors how long each agent has been quiet and proactively encourages under-participating agents to speak.
+*   **Dynamic Styles & Goals:** The Director assigns a specific **Tone** (e.g., "passive-aggressive") and **Objective** (e.g., "subtly insult the cookies") to each turn, ensuring spicy and varied dialogue.
+
+### 🎨 Clean UI & Observability
+*   **Color-Coded Text:** Each agent has a unique color. User input is Cyan, and Director instructions are Dimmed.
+*   **Quiet Servers:** Verbose logs from `llama.cpp` and background TTS/Audio systems are silenced, leaving only the "neat" conversation on your screen.
+
 ## 📂 File Descriptions
 
 ### 1. `ai.sh` (The Orchestrator)
@@ -121,12 +145,14 @@ WHISPER_EXECUTABLE = os.path.expanduser("~/whisper.cpp/build/bin/whisper-cli")
     ```bash
     ./ai.sh
     ```
-4.  **Interact:**
-    *   Speak into your microphone.
-    *   Say **"List tools"** to see what commands are available.
-    *   Say **"Create agent [Name]"** to add a new persona.
-    *   Say **"Enter chat room"** to let agents talk among themselves.
-    *   Say **"Exit"** to quit.
+4.  **Select a Mode:**
+    *   Press **'c'** for the default voice assistant.
+    *   Press **'a'** to manually create your own cast of characters.
+    *   Press **'m'** to instantly start the "Suburban Moms" drama.
+5.  **In the Chat Room:**
+    *   **Auto-Loop:** Press **Enter** to toggle "Non-Interactive Mode" ON/OFF.
+    *   **Manual Speak:** Just talk normally to participate.
+    *   **Exit:** Say **"Exit"** or use `Ctrl+C` to quit.
 
 ## 🧩 Troubleshooting
 

@@ -202,23 +202,10 @@ class AgentDirector:
         agent_map = {a.name: a for a in active_agents}
         profiles = "\n".join([f"- {a.name}: {a.base_prompt}" for a in active_agents])
 
-        if topic:
-            direction_prompt = f"The user wants the agents to discuss: '{topic}'. Pick the best agent to start this topic."
-        else:
-            direction_prompt = (
-                "No topic provided. Analyze the 'Description' of the agents.\n"
-                "1. Identify a specific interest, conflict, or personality quirk from one agent.\n"
-                "2. Have that agent start a conversation about that interest/quirk."
-            )
-
         system_prompt = (
-            f"You are a Stage Manager starting a scene.\n"
-            f"Active Characters:\n{profiles}\n"
-            f"Direction: {direction_prompt}\n"
-            "INSTRUCTIONS:\n"
-            "1. Select the character who should speak first.\n"
-            "2. Provide a 1-sentence instruction on WHAT they should say to kick off the chat.\n"
-            "Output JSON ONLY: {\"next_agent\": \"Name\", \"instruction\": \"...\"}"
+            f"Set the scene with:\n{profiles}\n"
+            f"Topic: {topic if topic else 'Interesting banter'}\n"
+            "Output JSON: {\"next_agent\": \"Name\", \"instruction\": \"...\"}"
         )
 
         try:
@@ -237,35 +224,35 @@ class AgentDirector:
                 instruction = data.get("instruction", "Hello.")
                 if name in agent_map:
                     return agent_map[name], instruction
-        except Exception as e:
-            log("DIRECTOR", f"Kickoff Error: {e}")
+        except Exception: pass
 
         target = random.choice(active_agents)
         return target, f"Start a conversation about {topic if topic else 'something interesting'}."
 
-    def select_next_speaker(self, active_agents: List[ChatAgent], last_speaker: str, last_message: str):
-        if not active_agents: return None, "Speak naturally."
-        if len(active_agents) == 1: return active_agents[0], "Respond to the user."
+    def select_next_speaker(self, active_agents: List[ChatAgent], last_speaker: str, last_message: str, silence_scores: Dict[str, int]):
+        if not active_agents: return None, "Respond."
+        if len(active_agents) == 1: return active_agents[0], "Respond."
 
-        agent_map = {a.name: a for a in active_agents}
-        profiles = "\n".join([f"- {a.name}: {a.base_prompt}" for a in active_agents])
+        # Filter out the last speaker immediately (Turn Enforcement)
+        available_agents = [a for a in active_agents if a.name != last_speaker]
+        if not available_agents: available_agents = active_agents 
+
+        agent_map = {a.name: a for a in available_agents}
+        # Pass silence scores to influence the LLM (Silence Tracking)
+        profiles = "\n".join([f"- {a.name} (Silent for {silence_scores.get(a.name, 0)} turns): {a.base_prompt}" for a in available_agents])
 
         system_prompt = (
-            f"You are a Stage Manager. Select the next speaker.\n"
-            f"Active Characters:\n{profiles}\n"
-            f"Last Speaker: {last_speaker}\n"
-            f"Last Message: \"{last_message[:200]}\"\n"
-            "INSTRUCTIONS:\n"
-            "1. Choose the character who should respond next.\n"
-            "2. Provide a 1-sentence instruction on how to respond.\n"
-            "Output JSON ONLY: {\"next_agent\": \"Name\", \"instruction\": \"...\"}"
+            f"Pick the next speaker. NEVER pick {last_speaker}.\n"
+            f"Cast:\n{profiles}\n"
+            f"Last Word: \"{last_message[:100]}\"\n"
+            "Output JSON: {\"next_agent\": \"Name\", \"tone\": \"short vibe\", \"objective\": \"secret goal\"}"
         )
         try:
             resp = self.session.post(
                 self.url,
                 json={
                     "messages": [{"role": "system", "content": system_prompt}],
-                    "temperature": 0.1, "max_tokens": 60
+                    "temperature": 0.8, "max_tokens": 100
                 }, timeout=5
             )
             if resp.status_code == 200:
@@ -273,19 +260,21 @@ class AgentDirector:
                 content = content.replace("```json", "").replace("```", "").strip()
                 data = json.loads(content)
                 name = data.get("next_agent")
-                instruction = data.get("instruction", "Respond naturally.")
+                tone = data.get("tone", "spicy")
+                obj = data.get("objective", "drive the conversation")
+                
                 if name in agent_map:
-                    return agent_map[name], instruction
-        except Exception:
-            pass
+                    # Dynamic Goals and Style
+                    return agent_map[name], f"Style: {tone}. Goal: {obj}"
+        except Exception: pass
 
-        available = [a for a in active_agents if a.name != last_speaker]
-        target = random.choice(available if available else active_agents)
-        return target, f"Respond to {last_speaker}."
+        target = random.choice(available_agents)
+        return target, "Keep it moving."
 
 class ChatRoom:
     def __init__(self):
         self.agents: Dict[str, ChatAgent] = {}
+        self.turns_since_spoke: Dict[str, int] = {}
         self.director = AgentDirector(http_session, LLAMA_SERVER_URL)
         self.system_voice = None
         # 10 Voices available
@@ -317,6 +306,7 @@ class ChatRoom:
         color = AGENT_COLORS[color_idx]
 
         self.agents[name] = ChatAgent(name, prompt, voice_id=voice, color=color)
+        self.turns_since_spoke[name] = 10 # Encourage early participation
         log("SYSTEM", f"Created Agent: {name} (Voice: {voice})")
         return f"Created {name}."
 
@@ -328,6 +318,7 @@ class ChatRoom:
                 break
         if target:
             del self.agents[target]
+            if target in self.turns_since_spoke: del self.turns_since_spoke[target]
             return f"Deleted agent {target}."
         return f"Could not find agent {name}."
 
@@ -380,6 +371,10 @@ class ChatRoom:
         last_message_content = "The room is open."
 
         if starter_agent:
+            # Silence Tracker logic
+            for n in self.turns_since_spoke: self.turns_since_spoke[n] += 1
+            self.turns_since_spoke[starter_agent.name] = 0
+
             print(f"{Colors.DIM}[{starter_agent.name}] Dir: {start_instruction}{Colors.RESET}")
             kickoff_context = [{"role": "system", "content": "The scene is beginning."}]
             other_names = [a.name for a in active_agents if a.name != starter_agent.name]
@@ -425,8 +420,13 @@ class ChatRoom:
 
             if not user_text: log("DIRECTOR", "Autonomy Triggered...")
 
-            target_agent, instruction = self.director.select_next_speaker(active_agents, last_speaker_name, last_message_content)
+            # Pass silence scores to Director
+            target_agent, instruction = self.director.select_next_speaker(active_agents, last_speaker_name, last_message_content, self.turns_since_spoke)
             if not target_agent: continue
+
+            # Silence Tracker logic
+            for n in self.turns_since_spoke: self.turns_since_spoke[n] += 1
+            self.turns_since_spoke[target_agent.name] = 0
 
             if interruption_event.is_set(): continue
             print(f"{Colors.DIM}[{target_agent.name}] Dir: {instruction}{Colors.RESET}")

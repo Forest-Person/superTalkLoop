@@ -46,7 +46,7 @@ sleep 5
 # --- Step 2: Start Llama Server (in Termux) ---
 echo "🔹 Starting Llama Server (Termux)..."
 if [ -d "$LLAMA_BUILD_DIR" ]; then
-    "$LLAMA_BUILD_DIR/llama-server" -m "$LLAMA_MODEL" -t 4 -c 5000 &
+    "$LLAMA_BUILD_DIR/llama-server" -m "$LLAMA_MODEL" -t 4 -c 5000 2> /dev/null &
     PID_LLAMA=$!
     sleep 10
 else

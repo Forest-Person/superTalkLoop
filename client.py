@@ -21,6 +21,7 @@ from collections import deque
 import threading
 import queue
 import subprocess
+import select
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -55,10 +56,26 @@ INTERRUPT_FRAME_COUNT = 10         # Decreased from 12 (Slightly snappier respon
 SILENCE_THRESHOLD_MS = 1500        # (Unchanged, keeps the listening window natural)
 AUTONOMY_TIMEOUT = 2               # Seconds to wait before agents take initiative
 
+# --- Display & Colors ---
+class Colors:
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+    RESET = "\033[0m"
+    DIM = "\033[2m"
+    BOLD = "\033[1m"
+
+AGENT_COLORS = [Colors.GREEN, Colors.YELLOW, Colors.BLUE, Colors.MAGENTA, Colors.CYAN]
+
 # --- Logging Helper ---
 def log(subsystem: str, message: str):
-    ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    print(f"[{ts}] [{subsystem}] {message}")
+    if subsystem in ["AUDIO", "TTS", "ROUTER"]: return
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"{Colors.DIM}[{ts}] [{subsystem}] {message}{Colors.RESET}")
 
 # --- Data Structures ---
 @dataclass
@@ -73,6 +90,7 @@ http_session = requests.Session()
 audio_lock = threading.Lock()
 interruption_event = threading.Event()
 ai_is_speaking_event = threading.Event()
+auto_loop = False
 
 global_turn_id = 0
 conversation_history = []
@@ -83,10 +101,11 @@ pending_action = None
 # --- CLASSES ---
 
 class ChatAgent:
-    def __init__(self, name, system_prompt, voice_id="M1"):
+    def __init__(self, name, system_prompt, voice_id="M1", color=Colors.WHITE):
         self.name = name
         self.base_prompt = system_prompt
         self.voice_id = voice_id
+        self.color = color
         self.history = []
 
     def _get_perspective_history(self):
@@ -293,9 +312,13 @@ class ChatRoom:
         else:
             voice = random.choice(available_voices)
         
-        self.agents[name] = ChatAgent(name, prompt, voice_id=voice)
+        # Assign Color
+        color_idx = len(self.agents) % len(AGENT_COLORS)
+        color = AGENT_COLORS[color_idx]
+
+        self.agents[name] = ChatAgent(name, prompt, voice_id=voice, color=color)
         log("SYSTEM", f"Created Agent: {name} (Voice: {voice})")
-        return f"Created {name} with voice style {voice}."
+        return f"Created {name}."
 
     def delete_agent(self, name):
         target = None
@@ -320,21 +343,13 @@ class ChatRoom:
             ("Atlas", "A grounded and strong-willed protector."),
             ("Selene", "A mysterious and philosophical observer.")
         ]
-        
-        used_voices = {agent.voice_id for agent in self.agents.values()}
-        if self.system_voice:
-            used_voices.add(self.system_voice)
+        for name, prompt in defaults:
+            self.add_agent(name, prompt)
 
-        available = [v for v in self.all_voices if v not in used_voices]
-        random.shuffle(available)
-
-        for i, (name, prompt) in enumerate(defaults):
-            if len(self.agents) < 4 and available:
-                voice = available[i % len(available)]
-                self.agents[name] = ChatAgent(name, prompt, voice_id=voice)
-
-    def run_session(self, participants_str=None, topic=None):
-        log("SYSTEM", f"Entering Room. Participants: {participants_str}, Topic: {topic}")
+    def run_session(self, participants_str=None, topic=None, auto_start=False):
+        global auto_loop
+        auto_loop = auto_start
+        log("SYSTEM", f"Entering Room. Participants: {participants_str}, Topic: {topic}, AutoLoop: {auto_loop}")
         
         if not self.agents:
             enqueue_tts("No agents found. Creating default group.", global_turn_id)
@@ -365,7 +380,7 @@ class ChatRoom:
         last_message_content = "The room is open."
 
         if starter_agent:
-            print(f"[{starter_agent.name}] STARTING: {start_instruction}")
+            print(f"{Colors.DIM}[{starter_agent.name}] Dir: {start_instruction}{Colors.RESET}")
             kickoff_context = [{"role": "system", "content": "The scene is beginning."}]
             other_names = [a.name for a in active_agents if a.name != starter_agent.name]
             other_names.append("User")
@@ -375,7 +390,7 @@ class ChatRoom:
                 director_instruction=start_instruction,
                 other_agent_names=other_names
             )
-            smart_buffer_stream(stream_gen, starter_agent.name, voice_id=starter_agent.voice_id)
+            smart_buffer_stream(stream_gen, starter_agent.name, voice_id=starter_agent.voice_id, color=starter_agent.color)
 
             if starter_agent.history:
                 last_message_content = starter_agent.history[-1]['content']
@@ -402,7 +417,7 @@ class ChatRoom:
                     enqueue_tts("Leaving room.", global_turn_id)
                     wait_for_turn()
                     break
-                print(f"\n[User]: {user_text}")
+                print(f"\n{Colors.CYAN}[User]: {user_text}{Colors.RESET}")
                 last_message_content = user_text
                 last_speaker_name = "User"
             elif not active_agents:
@@ -414,7 +429,7 @@ class ChatRoom:
             if not target_agent: continue
 
             if interruption_event.is_set(): continue
-            print(f"[{target_agent.name}] Dir: {instruction}")
+            print(f"{Colors.DIM}[{target_agent.name}] Dir: {instruction}{Colors.RESET}")
 
             context_input = f"{last_speaker_name}: {last_message_content}"
             other_names = [a.name for a in active_agents if a.name != target_agent.name]
@@ -426,7 +441,7 @@ class ChatRoom:
                 other_agent_names=other_names
             )
 
-            smart_buffer_stream(stream_gen, target_agent.name, voice_id=target_agent.voice_id)
+            smart_buffer_stream(stream_gen, target_agent.name, voice_id=target_agent.voice_id, color=target_agent.color)
 
             if target_agent.history:
                 last_message_content = target_agent.history[-1]['content']
@@ -458,8 +473,9 @@ def calculate_rms(frame_bytes):
 
 def trigger_interruption(source="User"):
     global global_turn_id
+    if auto_loop: return
     if not interruption_event.is_set():
-        print(f"\n[!] 🛑 Interrupted by {source}")
+        print(f"\n{Colors.RED}[!] 🛑 Interrupted by {source}{Colors.RESET}")
         interruption_event.set()
         global_turn_id += 1
         try:
@@ -481,6 +497,10 @@ def interruption_listener_worker():
             with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='int16', blocksize=FRAME_SIZE) as stream:
                 speech_frames = 0
                 while ai_is_speaking_event.is_set() and not interruption_event.is_set():
+                    if auto_loop: 
+                        time.sleep(0.5)
+                        continue
+                        
                     frame, overflow = stream.read(FRAME_SIZE)
                     if overflow: continue
                     raw_bytes = frame.tobytes()
@@ -574,14 +594,24 @@ def play_startup_sound():
     sd.play(wave, fs, blocking=True)
 
 def record_with_vad(timeout: Optional[float] = None):
-    global global_turn_id
+    global global_turn_id, auto_loop
     ai_is_speaking_event.clear()
+    
+    if select.select([sys.stdin], [], [], 0.0)[0]:
+        sys.stdin.readline()
+        auto_loop = not auto_loop
+        print(f"\n{Colors.DIM}[System] 🛑 Non-Interactive Mode: {'ON' if auto_loop else 'OFF'}{Colors.RESET}")
+
+    if auto_loop:
+        time.sleep(0.5)
+        return None
+
     time.sleep(0.2)
     vad = webrtcvad.Vad(VAD_RECORD_SENSITIVITY)
     start_time = time.time()
 
     label = "Listening" if timeout is None else f"Auto-Listen ({timeout}s)"
-    print(f"\n[Mic] 🎤 {label}...", end="", flush=True)
+    print(f"\n{Colors.DIM}[Mic] 🎤 {label}...{Colors.RESET}", end="", flush=True)
 
     try:
         with audio_lock: pass
@@ -595,7 +625,7 @@ def record_with_vad(timeout: Optional[float] = None):
                 if interruption_event.is_set(): return None
                 if timeout and not is_speaking:
                     if (time.time() - start_time) > timeout:
-                        print(" (Timeout)")
+                        print(f"{Colors.DIM} (Timeout){Colors.RESET}")
                         return None
 
                 frame, overflow = stream.read(FRAME_SIZE)
@@ -610,13 +640,13 @@ def record_with_vad(timeout: Optional[float] = None):
                         silence_counter = 0
                         voiced_frames.extend(ring_buffer)
                         ring_buffer.clear()
-                        print("●", end="", flush=True)
+                        print(f"{Colors.DIM}●{Colors.RESET}", end="", flush=True)
                 else:
                     voiced_frames.append(frame_bytes)
                     if not is_speech:
                         silence_counter += 1
                         if silence_counter >= (SILENCE_THRESHOLD_MS // FRAME_MS):
-                            print(" Done.")
+                            print(f"{Colors.DIM} Done.{Colors.RESET}")
                             break
                     else: silence_counter = 0
 
@@ -631,20 +661,20 @@ def record_with_vad(timeout: Optional[float] = None):
             return FINAL_AUDIO
     except: return None
 
-def smart_buffer_stream(token_generator, label="AI", voice_id="M1"):
+def smart_buffer_stream(token_generator, label="AI", voice_id="M1", color=Colors.WHITE):
     sentence_buffer = ""
     is_first_chunk = True
     FIRST_CHUNK_WORDS = 8
     SUBSEQ_CHUNK_WORDS = 25
 
-    print(f"{label}: ", end="")
+    print(f"{color}{label}: {Colors.RESET}", end="")
 
     for token in token_generator:
         if interruption_event.is_set():
-            print(" [Interrupted]")
+            print(f"{Colors.RED} [Interrupted]{Colors.RESET}")
             break
 
-        sys.stdout.write(token)
+        sys.stdout.write(f"{color}{token}{Colors.RESET}")
         sys.stdout.flush()
 
         clean_token = token.replace("<|tool_call_start|>", "").replace("<|tool_call_end|>", "")
@@ -839,6 +869,52 @@ def main():
     system_voice = random.choice(chat_room.all_voices)
     chat_room.set_system_voice(system_voice)
     log("SYSTEM", f"System Voice assigned: {system_voice}")
+
+    # --- Initial Selection Mode ---
+    print("\n--- Startup Menu ---")
+    print("[C]hat Mode (Default)")
+    print("[A]gent Creation Mode")
+    print("[M]eet the Moms (Quick Start)")
+    choice = input("Select Option (c/a/m): ").strip().lower()
+
+    if choice == 'm':
+        log("SYSTEM", "Creating Suburban Moms...")
+        moms = [
+            ("Karen", "Passive-aggressive PTA president who notices everyone's lawn flaws."),
+            ("Linda", "Overly competitive baker who insists her cookies are 'organic' and better."),
+            ("Susan", "The gossip queen who 'just wants everyone to get along' while stirring the pot.")
+        ]
+        for n, d in moms:
+            chat_room.add_agent(n, d)
+        
+        start_now = input("Enter Chat Room now? (y/n): ").strip().lower()
+        if start_now == 'y':
+            auto = input("Enable Auto-Loop (Non-interactive)? (y/n): ").strip().lower() == 'y'
+            chat_room.run_session("all", "The upcoming bake sale planning.", auto_start=auto)
+
+    elif choice == 'a':
+        print("\n--- Agent Creation Mode (Max 10) ---")
+        while len(chat_room.agents) < 10:
+            name = input("Agent Name: ").strip()
+            if not name: break
+            desc = input(f"Description for {name}: ").strip()
+            
+            res = chat_room.add_agent(name, desc)
+            print(f"-> {res}")
+
+            if len(chat_room.agents) >= 10:
+                print("Max agents reached.")
+                break
+            
+            cont = input("Create another? (y/n): ").strip().lower()
+            if cont != 'y': break
+        
+        if chat_room.agents:
+            start_now = input("Enter Chat Room with these agents? (y/n): ").strip().lower()
+            if start_now == 'y':
+                topic = input("Topic (optional): ").strip()
+                auto = input("Enable Auto-Loop (Non-interactive)? (y/n): ").strip().lower() == 'y'
+                chat_room.run_session("all", topic if topic else None, auto_start=auto)
 
     try:
         while True:

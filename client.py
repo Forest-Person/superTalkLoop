@@ -146,10 +146,11 @@ class ChatAgent:
                 LLAMA_SERVER_URL,
                 json={
                     "messages": full_context,
-                    "temperature": 0.7,
+                    "temperature": 0.65,
                     "max_tokens": 200,
                     "stream": True,
-                    "stop": stop_sequences
+                    "stop": stop_sequences,
+                    "repeat_penalty": 1.12
                 },
                 stream=True,
                 timeout=30
@@ -229,7 +230,7 @@ class AgentDirector:
         target = random.choice(active_agents)
         return target, f"Start a conversation about {topic if topic else 'something interesting'}."
 
-    def select_next_speaker(self, active_agents: List[ChatAgent], last_speaker: str, last_message: str, silence_scores: Dict[str, int]):
+    def select_next_speaker(self, active_agents: List[ChatAgent], last_speaker: str, last_message: str, silence_scores: Dict[str, int], narrative_context: str = ""):
         if not active_agents: return None, "Respond."
         if len(active_agents) == 1: return active_agents[0], "Respond."
 
@@ -244,16 +245,17 @@ class AgentDirector:
         system_prompt = (
             f"Pick the next speaker. NEVER pick {last_speaker}.\n"
             f"Cast:\n{profiles}\n"
-            f"Last Word: \"{last_message[:100]}\"\n"
-            "Output JSON: {\"next_agent\": \"Name\", \"tone\": \"short vibe\", \"objective\": \"secret goal\"}"
+            f"Current Situation/Event: {narrative_context}\n"
+            f"Last Word: \"{last_message[:150]}\"\n"
+            "Output JSON: {\"next_agent\": \"Name\", \"tone\": \"short vibe\", \"objective\": \"react to situation\"}"
         )
         try:
             resp = self.session.post(
                 self.url,
                 json={
                     "messages": [{"role": "system", "content": system_prompt}],
-                    "temperature": 0.8, "max_tokens": 100
-                }, timeout=5
+                    "temperature": 0.65, "max_tokens": 120, "repeat_penalty": 1.1
+                }, timeout=6
             )
             if resp.status_code == 200:
                 content = resp.json()['choices'][0]['message']['content']
@@ -265,17 +267,61 @@ class AgentDirector:
                 
                 if name in agent_map:
                     # Dynamic Goals and Style
-                    return agent_map[name], f"Style: {tone}. Goal: {obj}"
+                    return agent_map[name], f"Context: {narrative_context}. Style: {tone}. Goal: {obj}"
         except Exception: pass
 
         target = random.choice(available_agents)
         return target, "Keep it moving."
+
+class MetaDirector:
+    def __init__(self, session, model_url):
+        self.session = session
+        self.url = model_url
+        self.current_narrative = "The conversation is just beginning."
+
+    def assess_situation(self, history: List[Dict[str, str]]):
+        if not history: return
+        
+        # Analyze the last few turns
+        recent_log = "\n".join([f"{m['role']}: {m['content']}" for m in history[-6:]])
+        
+        system_prompt = (
+            "You are the Meta-Director. You control the plot.\n"
+            "Analyze the recent chat. Is it repetitive (looping)? Is it boring?\n"
+            "Generate a 'Stage Direction' to advance the story or break the loop.\n"
+            "Examples: 'The lights flicker ominously.', 'A loud knock at the door.', 'Everyone realizes they are hungry.', 'Raise the tension.'\n"
+            "Output JSON: {\"status\": \"ok/stuck\", \"new_direction\": \"...\"}"
+        )
+
+        try:
+            resp = self.session.post(
+                self.url,
+                json={
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Recent Chat:\n{recent_log}"}
+                    ],
+                    "temperature": 0.7, "max_tokens": 100
+                }, timeout=10
+            )
+            if resp.status_code == 200:
+                content = resp.json()['choices'][0]['message']['content']
+                content = content.replace("```json", "").replace("```", "").strip()
+                data = json.loads(content)
+                direction = data.get("new_direction")
+                if direction:
+                    self.current_narrative = direction
+                    log("META", f"New Direction: {direction}")
+                    print(f"{Colors.MAGENTA}[Meta Director] ➤ {direction}{Colors.RESET}")
+        except Exception as e:
+            log("META", f"Error: {e}")
 
 class ChatRoom:
     def __init__(self):
         self.agents: Dict[str, ChatAgent] = {}
         self.turns_since_spoke: Dict[str, int] = {}
         self.director = AgentDirector(http_session, LLAMA_SERVER_URL)
+        self.meta_director = MetaDirector(http_session, LLAMA_SERVER_URL)
         self.system_voice = None
         # 10 Voices available
         self.all_voices = [
@@ -369,6 +415,8 @@ class ChatRoom:
         starter_agent, start_instruction = self.director.start_conversation(active_agents, topic)
         last_speaker_name = "User"
         last_message_content = "The room is open."
+        session_history = []
+        turn_count = 0
 
         if starter_agent:
             # Silence Tracker logic
@@ -390,6 +438,7 @@ class ChatRoom:
             if starter_agent.history:
                 last_message_content = starter_agent.history[-1]['content']
                 last_speaker_name = starter_agent.name
+                session_history.append({"role": last_speaker_name, "content": last_message_content})
 
             wait_for_turn()
 
@@ -415,13 +464,25 @@ class ChatRoom:
                 print(f"\n{Colors.CYAN}[User]: {user_text}{Colors.RESET}")
                 last_message_content = user_text
                 last_speaker_name = "User"
+                session_history.append({"role": "User", "content": user_text})
             elif not active_agents:
                 continue
 
             if not user_text: log("DIRECTOR", "Autonomy Triggered...")
 
-            # Pass silence scores to Director
-            target_agent, instruction = self.director.select_next_speaker(active_agents, last_speaker_name, last_message_content, self.turns_since_spoke)
+            # --- META DIRECTOR CYCLE ---
+            turn_count += 1
+            if turn_count % 4 == 0:
+                self.meta_director.assess_situation(session_history)
+
+            # Pass silence scores and Meta Narrative to Director
+            target_agent, instruction = self.director.select_next_speaker(
+                active_agents, 
+                last_speaker_name, 
+                last_message_content, 
+                self.turns_since_spoke,
+                narrative_context=self.meta_director.current_narrative
+            )
             if not target_agent: continue
 
             # Silence Tracker logic
@@ -447,6 +508,9 @@ class ChatRoom:
                 last_message_content = target_agent.history[-1]['content']
             else:
                 last_message_content = "..."
+            
+            session_history.append({"role": target_agent.name, "content": last_message_content})
+            if len(session_history) > 15: session_history.pop(0)
 
             last_speaker_name = target_agent.name
             wait_for_turn()
